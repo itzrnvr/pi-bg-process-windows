@@ -1,0 +1,28 @@
+{
+  "name": "pi-bg-process-windows",
+  "version": "2.0.0",
+  "description": "Windows-first auto-backgrounding for PI - PowerShell-based, timeout-triggered, with auto-notification on completion",
+  "piPackage": {
+    "type": "extension",
+    "tools": ["bash", "bg_status"],
+    "commands": ["tasks"]
+  },
+  "keywords": ["pi-package", "background", "powershell", "windows", "auto-background"],
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist/",
+    "SKILL.md",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "bun build ./src/index.ts --outdir ./dist --target node",
+    "watch": "bun build ./src/index.ts --outdir ./dist --target node --watch"
+  },
+  "peerDependencies": {
+    "@mariozechner/pi-coding-agent": ">=0.60.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0"
+  }
+}
