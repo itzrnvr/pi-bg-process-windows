@@ -1,34 +1,27 @@
-# SKILL: Background Process Management
+# SKILL: Background Process Management (Windows)
 
 ## What This Extension Does
 
-Automatically backgrounds long-running bash commands on Windows:
+Automatically backgrounds long-running bash commands on Windows, with optional PTY support for interactive processes.
 
-- Commands that finish in <15s return normally (no change in behavior)
-- Commands still running after 15s are auto-detached and continue running
-- LLM gets auto-notified when the background process completes
-- User can check/manage via `/win_tasks`
+- **sync: true** (default): Fast spawn. Commands finishing within 60s return normally. Longer commands auto-background.
+- **sync: false**: PTY spawn. Runs in a real terminal immediately. Agent can peek at output and send input.
+- `[BG_DONE]` notifications arrive automatically when processes complete — no user prompt needed.
 
-## When Backgrounding Happens
-
-Any bash command that exceeds 15 seconds is automatically backgrounded. This includes:
-- cmake builds
-- npm install on large projects
-- Long-running test suites
-- Any command the LLM runs via the bash tool
-
-## Decision Flow
+## When to Use Each Mode
 
 ```
 Command needs to run?
     ↓
-Will it take > 15 seconds AND you don't need the result immediately?
-    ├─ YES → Use run_in_background: true (background immediately)
+Will it need interaction (prompts, passwords, confirmations)?
+    ├─ YES → Use sync: false (PTY mode)
+    │        Agent can send input via win_bg_status input
     │
-    ├─ MAYBE, but you need it to finish this turn → Use no_background: true
-    │        (waits for completion; disables auto-backgrounding)
+    ├─ Just a long build/install you want in background?
+    │   → Use sync: false (starts in background immediately)
     │
-    └─ NO → Just call bash normally
+    └─ Normal quick command or you need the result this turn?
+        → Use sync: true (default) or just call bash normally
 ```
 
 ## Tools Available
@@ -36,29 +29,32 @@ Will it take > 15 seconds AND you don't need the result immediately?
 ### `bash` (shadows built-in)
 
 ```json
-// Normal usage — auto-backgrounds after 15s if still running
+// Normal usage — auto-backgrounds after 60s if still running
 { "command": "cmake --build build" }
 
-// Background immediately (for builds, installs, dev servers)
-{ "command": "npm install", "run_in_background": true }
+// PTY mode — for interactive or explicitly background tasks
+{ "command": "docker build -t app .", "sync": false }
 
-// Wait for completion — disable auto-backgrounding
-{ "command": "find . -name '*.ts'", "no_background": true }
+// PTY mode — for commands needing input
+{ "command": "sudo apt update", "sync": false }
 ```
 
 ### `win_bg_status` (for LLM)
 
 ```
-win_bg_status({ action: "list" })           → show all backgrounded processes
-win_bg_status({ action: "delta" })          → only changed since last check
-win_bg_status({ action: "log", pid: 123 })  → view process output
-win_bg_status({ action: "stop", pid: 123 }) → kill process tree
-win_bg_status({ action: "progress", pid: 123 }) → check if running/stalled
+win_bg_status({ action: "list" })                                    → show all backgrounded processes
+win_bg_status({ action: "delta", lastKnownHash: "abc" })            → only changed since last check
+win_bg_status({ action: "peek", pid: 123 })                          → last 30 lines of output
+win_bg_status({ action: "peek", pid: 123, lines: 50, offset: 30 })  → scroll back 30 lines, show 50
+win_bg_status({ action: "input", pid: 123, inputText: "y\n" })      → send 'y' + Enter to PTY process
+win_bg_status({ action: "log", pid: 123 })                           → view full output log (15K chars)
+win_bg_status({ action: "stop", pid: 123 })                          → kill process tree
+win_bg_status({ action: "progress", pid: 123 })                      → check if running/stalled/done
 ```
 
 ### `win_path` (for LLM)
 
-Converts any Windows path into all three common formats at once. Use this instead of guessing `cygpath` round-trips.
+Converts any Windows path into all three common formats at once.
 
 ```json
 { "path": "C:\\Users\\name\\Documents" }
@@ -75,16 +71,22 @@ file://:   file:///C:/Users/name/Documents
 
 ```
 /win_tasks               → list all background tasks
-/win_tasks output 123    → view output for PID 123
-/win_tasks kill 123      → kill process tree for PID 123
+/win_tasks 123           → view output for PID 123 (scrollable TUI)
 ```
 
 ## After Backgrounding
 
-When a command gets backgrounded, you'll see:
+When a command gets auto-backgrounded (sync: true, exceeded 60s):
 
 ```
-Command exceeded the assistant-mode blocking budget (15s) and was moved to the background with PID: 49281.
+Command still running after 60s, moved to background (PID: 49281, PTY mode).
+Peek: win_bg_status peek 49281. Input: win_bg_status input 49281 "text".
+```
+
+When started with sync: false:
+
+```
+Command running in background (PID: 49281, PTY mode). You can peek at output with: win_bg_status peek 49281.
 ```
 
 When it completes, you'll automatically receive:
@@ -95,45 +97,26 @@ Command: cmake --build build
 ...output...
 ```
 
-## What You Can Do While Waiting
-
-While a background process runs, you can:
-- Ask the LLM to do other work (read files, search code, etc.)
-- Check progress: `win_bg_status({ action: "log", pid: 49281 })`
-- Stop it: `win_bg_status({ action: "stop", pid: 49281 })`
-- Or user: `/win_tasks output 49281`
-
 ## Common Patterns
 
 ### Pattern 1: Long build or install
 ```json
-{ "command": "npm install", "run_in_background": true }
+{ "command": "docker build -t app .", "sync": false }
 ```
 
-### Pattern 2: Search you need synchronously
+### Pattern 2: Interactive command needing input
 ```json
-{ "command": "find . -name '*.test.ts'", "no_background": true }
+{ "command": "ssh-keygen -t ed25519", "sync": false }
 ```
+Then: `win_bg_status input 1234 "\n"` to send Enter for default path.
 
-### Pattern 3: Write + lint + test a script in one call
-Instead of three separate bash calls, write the file first, then run validation in a single compound command:
-
+### Pattern 3: Quick command you need now
 ```json
-{
-  "command": "cat > test-script.js << 'EOF'\nconst add = (a, b) => a + b;\nconsole.log(add(2, 3));\nEOF && node -c test-script.js && node test-script.js",
-  "no_background": true
-}
+{ "command": "find . -name '*.test.ts'" }
 ```
+Uses default sync: true, returns output directly.
 
-Or for PowerShell-friendly one-liners:
-```json
-{
-  "command": "echo 'console.log(1+1)' > test.js && node -c test.js && node test.js",
-  "no_background": true
-}
-```
-
-### Pattern 4: Path conversion before using a file:// URL
+### Pattern 4: Path conversion
 ```json
 { "path": "C:\\Users\\name\\Documents\\project\\file.txt" }
 ```
@@ -141,7 +124,8 @@ Use the `file://` output for Node `new URL()` or browser preload URLs.
 
 ## Edge Cases
 
-- **Interactive commands** (needing stdin) will hang and get backgrounded, then never finish
-- **Very short commands** (<15s) are never affected
+- **Interactive commands with sync: true** (default) will hang and get backgrounded, then cannot receive input — use `sync: false` for interactive commands
+- **Very short commands** (<60s) are never affected when sync: true
 - **Process tree killing** uses SIGKILL + PowerShell orphan cleanup for cmake/cl.exe trees
-- **Using `no_background: true`** on very long commands (>2–3 minutes) will block the agent — only use it when you genuinely need the result before continuing
+- **[BG_SILENT]** notification after 30s with no output — agent can peek to decide if stalled
+- **PTY unavailable** — falls back to regular spawn (no input capability, but still auto-backgrounds)

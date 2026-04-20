@@ -1,122 +1,88 @@
 # Project Learnings: pi-bg-process-windows
 
 **Created:** 2026-04-03
-**Last Updated:** 2026-04-13 (v3.0 — Claude Code Style)
+**Last Updated:** 2026-04-20 (v4.0 — Modular + PTY)
 
 ---
 
 ## Critical Discoveries
 
-### 1. Platform-Specific Command Blindness (Windows/Node)
+### 1. taskkill /T /F hangs from Node/Bun
 
-**Symptom:** Agent repeatedly tried `taskkill /F /IM` to reset environment. Terminal hung, orphans left behind, agent got "stuck" in non-responsive state.
+`taskkill /T /F /PID` is the documented way to kill process trees on Windows. It **hangs** (ETIMEDOUT) when called via `execSync`, `execFileSync`, or `exec` from Node.js or Bun, targeting a process that is a child of the current process.
 
-**Cause:** Windows process management is fundamentally different from Unix:
-- `taskkill /T /F /PID` **hangs** when called from Node/Bun targeting child processes (ETIMEDOUT)
-- `taskkill /F /IM` (by image name) is blunt-force and unreliable for Node processes
-- Orphan processes survive parent death on Windows (unlike Unix SIGTERM cascade)
-- PowerShell `Stop-Process` has different behavior than `taskkill`
+**Solution:** SIGKILL the parent, then spawn a detached PowerShell process to find and kill orphans via `Get-CimInstance Win32_Process`.
 
-**Solution:** Implement surgical process management in extension code:
 ```typescript
-// 1. SIGKILL the parent instantly (works from Node)
 process.kill(pid, "SIGKILL");
-
-// 2. Spawn detached PowerShell to clean up orphans
 spawn("powershell.exe", [
   "-NoProfile", "-Command",
   `Get-CimInstance Win32_Process -Filter 'ParentProcessId=${pid}' | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }`
 ], { windowsHide: true, stdio: "ignore", detached: true }).unref();
 ```
 
-**Lesson:** Never rely on CLI process management on Windows from Node. Use native `process.kill()` + async orphan cleanup.
+### 2. deliverAs: "nextTurn" vs "followUp"
 
-### 2. Why Claude Code Style (15s + run_in_background)?
+**Symptom:** `[BG_DONE]` notifications never arrived until the user sent their next prompt.
 
-**Symptom:** Model was confused by forced 10s backgrounding. It would set `timeout` to wait longer, defeating the purpose.
+**Cause:** `deliverAs: "nextTurn"` pushes to `_pendingNextTurnMessages`, which only get injected when `prompt()` is called (i.e., when user types something). The notification sits in a queue forever.
 
-**Cause:** No explicit escape hatch. The model couldn't express intent to background immediately.
-
-**Solution:** Copy Claude Code exactly:
-- 15s assistant-mode blocking budget (was 10s)
-- `run_in_background: true` parameter for explicit immediate backgrounding
-- Different messages for auto vs explicit backgrounding
-
-**Result:** Model can now express intent: "I know this will take long, background it now" vs "This should be quick, let it run."
-
-### 3. Preview Bug — Capture Before Clear
-
-**Symptom:** Model always saw `(waiting for output...)` even when pre-timeout output existed.
-
-**Cause:** Code cleared `memOutput` before reading the preview.
+**Solution:** Use `deliverAs: "followUp"`. When the agent is streaming, this calls `this.agent.followUp(appMessage)` which queues the message for delivery after the current turn. When the agent is idle with `triggerTurn: true`, it calls `await this.agent.prompt(appMessage)` which starts a new turn immediately.
 
 ```typescript
-// WRONG — preview is always empty
-logStream.write(memOutput);
-memOutput = "";  // cleared!
-const preview = memOutput.slice(0, 500);  // always ""
+// ✅ CORRECT — auto-notifies agent
+pi.sendMessage(
+  { customType: "bgProcessDone", content: "...", display: true },
+  { triggerTurn: true, deliverAs: "followUp" }
+);
+
+// ❌ WRONG — waits for next user prompt
+pi.sendMessage(
+  { customType: "bgProcessDone", content: "...", display: true },
+  { triggerTurn: true, deliverAs: "nextTurn" }
+);
 ```
 
-**Solution:** Capture preview BEFORE clearing.
+### 3. node-pty npm install hangs in monorepos
+
+**Symptom:** `npm install node-pty` hangs forever at `node-gyp rebuild` in monorepo directories with lockfiles.
+
+**Cause:** Native addon compilation via node-gyp can stall when package managers hold locks. Node 24 (ABI v137) has no prebuilt binaries, forcing compilation.
+
+**Solution:** Install node-pty in a clean directory outside the monorepo (installs in 3 seconds with prebuilts), then copy the entire `node_modules/node-pty` to the extension's `native/` directory. At runtime, `pty.ts` sets `NODE_PATH` to include `native/prebuilds/win32-x64` and requires the JS wrapper.
+
+### 4. PTY overhead causes false backgrounding for sync: true
+
+**Symptom:** Quick commands like `echo hello` were getting auto-backgrounded when spawned via PTY.
+
+**Cause:** ConPTY setup adds ~2-5s overhead (spawning OpenConsole.exe, terminal initialization). This caused the 60s sync timeout to be reached for commands that should complete instantly.
+
+**Solution:** Only use PTY for `sync: false` commands. Use regular `spawn` with piped stdio for `sync: true`.
+
+### 5. Heuristic stall detection produces false positives
+
+**Symptom:** Docker builds (trailing `:`), cargo builds (silent compilation), and git clone (pack phase) were falsely flagged as stalled.
+
+**Cause:** Pattern-based heuristics can't distinguish "waiting for input" from "legitimately producing no output." 
+
+**Solution:** Replace heuristics with "show the agent what's happening." After 30s with no output, send `[BG_SILENT]` with the last 20 lines of output and let the agent decide.
+
+### 6. node-pty ConPTY path handling works correctly
+
+**Symptom:** Concern that `C:\Program Files\Git\bin\bash.exe` with backslashes might get mangled.
+
+**Testing:** Both `C:\Program Files\Git\bin\bash.exe` (backslashes) and `C:/Program Files/Git/bin/bash.exe` (forward slashes) spawn correctly via node-pty. The `argsToCommandLine` function in node-pty's `windowsPtyAgent.js` properly handles MSDN escaping conventions. `CreateProcessW` receives the command line correctly.
+
+### 7. pi.sendMessage signature
 
 ```typescript
-// CORRECT — preview has actual content
-const preview = memOutput.slice(0, 500);
-logStream.write(memOutput);
-memOutput = "";  // now safe to clear
-```
-
-### 4. taskkill /T /F hangs from Node/Bun
-
-`taskkill /T /F /PID` is the documented way to kill process trees on Windows. It **hangs** (ETIMEDOUT) when called via `execSync`, `execFileSync`, or `exec` from Node.js or Bun, targeting a process that is a child of the current process.
-
-Both `taskkill /F /PID` (without /T) and `taskkill /T /F /PID` hang. `process.kill(pid, "SIGKILL")` works instantly (calls `TerminateProcess`).
-
-**Workaround:** SIGKILL the parent, then spawn a detached PowerShell process to find and kill orphans via `Get-CimInstance Win32_Process -Filter 'ParentProcessId=...'`.
-
-### 5. BashResult vs AgentToolResult
-
-The `user_bash` event handler must return `{ result: BashResult }` where:
-
-```typescript
-interface BashResult {
-  output: string;
-  exitCode: number | undefined;
-  cancelled: boolean;
-  truncated: boolean;
-  totalLines: number;
-  totalBytes: number;
-  outputLines: number;
-  outputBytes: number;
-}
-```
-
-Returning `AgentToolResult` shape (`{ content: [{ type: "text", text }], details: {} }`) causes `textContent.unshift is not a function` crash in pi's `recordBashResult()`.
-
-### 6. Built-in bash uses Git Bash, NOT PowerShell
-
-The built-in bash tool resolves to Git Bash at `C:\Program Files\Git\bin\bash.exe`, uses persistent shell sessions via brush-core native bindings, has 300s default timeout, and sets non-interactive env vars (CI=1, PAGER=cat, etc.).
-
-The extension must use the same shell for command compatibility.
-
-### 7. Tool Shadowing via registerTool
-
-`pi.registerTool({ name: "bash" })` shadows the built-in bash tool. The last extension to register a tool with a given name wins. This is how the extension intercepts all LLM bash calls without needing a separate tool.
-
-### 8. user_bash intercepts `!` commands
-
-The `user_bash` event fires when the user types `!` prefix commands. The handler can return `{ result: BashResult }` to fully replace execution. If it returns `undefined`, pi falls through to the built-in handler.
-
-### 9. pi.sendMessage signature
-
-```typescript
-// CORRECT — 2 parameter form
+// ✅ CORRECT — 2 parameter form
 pi.sendMessage(
   { customType: "...", content: "...", display: true },
   { triggerTurn: true, deliverAs: "followUp" }
 );
 
-// WRONG — causes [undefined] in UI
+// ❌ WRONG — causes [undefined] in UI
 pi.sendMessage({
   content: "...",
   display: true,
@@ -124,24 +90,34 @@ pi.sendMessage({
 });
 ```
 
+### 8. itmux/Cygwin paths don't work for Windows PTY
+
+**Symptom:** itmux (Windows tmux bundler) produces path resolution errors and environment mismatches.
+
+**Cause:** itmux bundles a Cygwin-based tmux. Cygwin paths (`/cygdrive/c/...`) and environment differ from the Windows host. Commands run inside itmux can't find tools at their expected Windows paths.
+
+**Solution:** Use node-pty instead — it uses Windows native ConPTY API (same as VS Code terminal), preserving the same paths, environment, and output.
+
 ---
 
 ## Technical Insights
 
-### Process Lifecycle on Windows
+### ConPTY Two-Phase Spawn
 
-```
-spawn(bash, ["-l", "-c", "cmake --build"])
-  └── cmake.exe
-        ├── cl.exe (compiler)
-        └── link.exe (linker)
+node-pty's ConPTY implementation works in two phases:
+1. `PtyStartProcess` — creates pseudoconsole (named pipes for input/output), returns pipe names
+2. `PtyConnect` — connects to pipes, calls `CreateProcessW` with the command line
 
-process.kill(bash_pid, "SIGKILL")
-  → bash dies instantly
-  → cmake, cl.exe, link.exe become orphans
-  → PowerShell Get-CimInstance finds them by parent PID
-  → Stop-Process -Force kills them
-```
+The `argsToCommandLine` function in `windowsPtyAgent.js` handles MSDN command-line escaping (backslashes before `"` get doubled, spaces trigger quoting).
+
+### PTY Output Processing
+
+PTY output contains terminal control sequences that must be stripped before sending to the LLM:
+- CSI sequences: `\x1b[...letter` (colors, cursor movement)
+- DEC private modes: `\x1b[?25h` (cursor show), `\x1b[?1004h` (focus reporting)
+- OSC sequences: `\x1b]0;title\x07` (window title)
+- Charset designations: `\x1b(B`
+- Line endings: `\r\n` → `\n`, standalone `\r` removed
 
 ### Memory Management After Backgrounding
 
@@ -149,52 +125,17 @@ Before timeout: accumulate output in memory (needed for normal return).
 After timeout: stream to log file only via `createWriteStream`. Stop appending to memory strings.
 On completion: read log file for notification content (bounded to last N chars).
 
-This keeps memory O(1) after backgrounding regardless of output size.
-
 ### PID Reuse Protection
 
 After a process finishes and the LLM is notified, schedule the entry for removal from `bgProcesses` map after 60s. This prevents stale entries from being confused with new processes that reuse the same PID.
 
 ---
 
-## PI Extension API Notes
-
-### Tool execute() signature
-
-```typescript
-execute(
-  toolCallId: string,
-  params: Static<TParams>,
-  signal: AbortSignal | undefined,    // 3rd param
-  onUpdate: AgentToolUpdateCallback | undefined,  // 4th param
-  ctx: ExtensionContext,              // 5th param
-): Promise<AgentToolResult>
-```
-
-### Event handler signatures
-
-```typescript
-pi.events.on("user_bash", async (event: UserBashEvent): Promise<UserBashEventResult | undefined> => { ... });
-pi.events.on("session_shutdown", async () => { ... });
-pi.events.on("tool_call", async (event): Promise<ToolCallEventResult | undefined> => { ... });  // can only block
-pi.events.on("tool_result", async (event): Promise<ToolResultEventResult | undefined> => { ... });  // can modify results
-```
-
----
-
-## Testing
-
-See [TESTING-2026-04-11.md](TESTING-2026-04-11.md) for the standalone test harness.
-
-```bash
-bun run test    # 8 tests, no pi needed
-bun run dev     # watch mode
-```
-
-### Version History
+## Version History
 
 | Version | Date | Key Changes |
 |---------|------|-------------|
 | v1.0 | 2026-04-03 | Initial release with PowerShell backgrounding |
 | v2.0 | 2026-04-11 | Rewritten for Git Bash, forced 10s backgrounding |
 | v3.0 | 2026-04-13 | Claude Code style: 15s budget + `run_in_background` parameter |
+| v4.0 | 2026-04-20 | Modular architecture, PTY via node-pty, sync param, peek/input, deliverAs followUp fix |
