@@ -2,3 +2,6 @@ node_modules/
 dist/
 ~/
 *.lock
+native/
+*.html
+src/test.ts

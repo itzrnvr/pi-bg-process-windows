@@ -1,80 +1,98 @@
 # pi-bg-process-windows
 
-Windows-first auto-backgrounding for PI Coding Agent. Commands that exceed a timeout threshold are automatically detached and continue running in the background, with completion auto-notified to the LLM.
+Auto-backgrounding for PI Coding Agent on Windows. Commands that exceed a timeout are automatically detached and continue running in the background, with completion auto-notified to the LLM.
+
+**Version 2.0** — rewritten to use bash (not PowerShell), with proper process tree killing, bounded memory, and AbortSignal support.
 
 ## How It Works
 
 ```
-Agent calls bash → "run npm install"
+LLM calls bash tool → "run cmake --build"
        │
-       ├── Finishes within 10s ──→ Returns output normally
+       ├── Finishes within 15s → Returns output normally
        │
-       └── Still running after 10s ──→ AUTO-BACKGROUND
+       └── Still running after 15s → AUTO-BACKGROUND (always)
                   │
-                  ├─ child.unref() → Node stops waiting, process keeps running
-                  ├─ Log written to %TEMP%\pi-bg\bg-<timestamp>-<pid>.log
-                  ├─ Returns immediately: PID + log path
+                  ├── child.unref() — process keeps running
+                  ├── Streams to log file (memory stays bounded)
+                  ├── Returns immediately: PID + log path + output so far
                   │
-                  └─ When done → pi.sendMessage() auto-notifies LLM
+                  └── On completion → pi.sendMessage() auto-notifies LLM
 ```
 
 ## Features
 
-- **Auto-backgrounding** — Commands exceeding 10s timeout are detached, not killed
+- **Shadows built-in bash** — registers tool named `"bash"`, replaces built-in transparently
+- **Claude Code-style auto-backgrounding** — commands exceeding 15s auto-background (assistant-mode blocking budget)
+- **Explicit backgrounding** — set `run_in_background: true` to immediately background without waiting
+- **Opt-out of auto-backgrounding** — set `no_background: true` to wait for completion synchronously
 - **Auto-notification** — `pi.sendMessage()` fires when background process completes
-- **`win_bg_status` tool** — Agent-facing: `list`, `log`, `stop` by PID
-- **`/win_tasks` command** — User-facing: `/win_tasks list`, `/win_tasks output <pid>`, `/win_tasks kill <pid>`
-- **Windows-native** — Uses `powershell.exe`, proper temp paths, `windowsHide: true`
-- **Shutdown cleanup** — Kills all running background processes on session exit
+- **Process tree kill** — SIGKILL + PowerShell orphan cleanup (cmake, cl.exe, etc.)
+- **Memory-bounded** — after backgrounding, streams to log file only (no RAM growth)
+- **AbortSignal** — respects cancellation from pi's tool execution
+- **Shutdown-safe** — guards against late `sendMessage()` during teardown
+- **`win_bg_status` tool** — agent-facing: `list`, `delta`, `log`, `stop`, `progress`
+- **`win_path` tool** — convert paths to Git Bash / Win32 / file:// formats in one shot
+- **`/win_tasks` command** — user-facing: list, view output, kill
 
 ## Installation
 
-This extension is referenced directly in `~/.pi/agent/settings.json`:
+Referenced in `~/.pi/agent/settings.json`:
 
 ```json
 {
   "packages": [
-    "C:\\Users\\babys\\Documents\\code\\pi-extensions-dev\\pi-bg-process-windows"
+    { "source": "C:\\Users\\babys\\Documents\\code\\pi-extensions-dev\\pi-bg-process-windows" }
   ]
 }
 ```
 
-## Build
+## Build & Test
 
 ```bash
 cd C:\Users\babys\Documents\code\pi-extensions-dev\pi-bg-process-windows
-bun build ./src/index.ts --outdir ./dist --target node
+
+# Build
+bun run build
+
+# Run tests (no pi restart needed)
+bun run test
+
+# Watch mode — reruns tests on file changes
+bun run dev
 ```
+
+See [TESTING-2026-04-11.md](TESTING-2026-04-11.md) for full testing documentation.
 
 ## Tools Registered
 
-| Tool            | Purpose                                    |
-| --------------- | ------------------------------------------ |
-| `win_bash`      | Windows PowerShell — auto-backgrounds on timeout |
-| `win_bg_status` | List/view/stop background processes        |
+| Tool | Purpose |
+|------|---------|
+| `bash` | Shadows built-in — auto-backgrounds on timeout |
+| `win_bg_status` | List/view/stop background processes |
+| `win_path` | Path normalization (Git Bash, Win32, file://) |
 
 ## Commands Registered
 
-| Command      | Purpose                           |
-| ------------ | --------------------------------- |
+| Command | Purpose |
+|---------|---------|
 | `/win_tasks` | User-facing background task manager |
 
-## Configuration
+## Architecture
 
-| Constant        | Default     | Description                          |
-| --------------- | ----------- | ------------------------------------ |
-| `BG_TIMEOUT_MS` | `10_000`    | Milliseconds before auto-backgrounding |
+```
+resolveShell()     → finds Git Bash (C:\Program Files\Git\bin\bash.exe)
+killTree(pid)      → SIGKILL parent + PowerShell orphan cleanup
+executeWithTimeout → spawns bash, 15s timeout, auto-backgrounds
+```
 
-## Differences from oh-pi's bg-process
-
-| Feature              | oh-pi bg-process          | pi-bg-process-windows        |
-| -------------------- | ------------------------- | ---------------------------- |
-| Shell                | `bash` (broken on Windows) | `powershell.exe` (Windows-native) |
-| Temp paths           | `/tmp/oh-pi-bg-*.log`     | `%TEMP%\pi-bg\bg-*.log`      |
-| Timeout              | 10s                       | 10s (configurable)           |
-| Notification         | `pi.sendMessage()` (wrong signature) | `pi.sendMessage()` (correct 2-param form) |
-| User command         | None                      | `/win_tasks`                 |
-| Tool names           | `bash`, `bg_status`       | `win_bash`, `win_bg_status` (no conflicts) |
+Entry points:
+- `pi.registerTool({ name: "bash" })` — shadows built-in (LLM calls)
+- `pi.events.on("user_bash")` — intercepts `!` prefix commands
+- `pi.registerTool({ name: "win_bg_status" })` — process management
+- `pi.registerTool({ name: "win_path" })` — path conversion
+- `pi.registerCommand("win_tasks")` — user-facing
+- `pi.events.on("session_shutdown")` — cleanup
 
 ## License
 

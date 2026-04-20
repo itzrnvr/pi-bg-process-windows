@@ -1,515 +1,200 @@
-# Project Learnings: pi-background-bash
+# Project Learnings: pi-bg-process-windows
 
-**Created:** 2026-04-03  
-**Last Updated:** 2026-04-03  
-**Purpose:** Document mistakes, insights, and technical gotchas for future agents
+**Created:** 2026-04-03
+**Last Updated:** 2026-04-13 (v3.0 — Claude Code Style)
 
 ---
 
-## 🔴 Critical Mistakes Made (Don't Repeat These!)
+## Critical Discoveries
 
-### Mistake 1: Assuming PI API Matches Documentation
+### 1. Platform-Specific Command Blindness (Windows/Node)
 
-**What Happened:**
-I implemented `pi.registerHook()` based on my understanding of extension APIs, but it doesn't exist in PI. This caused the extension to fail loading with:
-```
-Failed to load extension: pi.registerHook is not a function
-```
+**Symptom:** Agent repeatedly tried `taskkill /F /IM` to reset environment. Terminal hung, orphans left behind, agent got "stuck" in non-responsive state.
 
-**Root Cause:**
-PI's extension API is different from typical hook-based systems. It uses:
-- `pi.on(event, handler)` for event subscriptions
-- `pi.registerTool()` for tools
-- `pi.registerCommand()` for slash commands
+**Cause:** Windows process management is fundamentally different from Unix:
+- `taskkill /T /F /PID` **hangs** when called from Node/Bun targeting child processes (ETIMEDOUT)
+- `taskkill /F /IM` (by image name) is blunt-force and unreliable for Node processes
+- Orphan processes survive parent death on Windows (unlike Unix SIGTERM cascade)
+- PowerShell `Stop-Process` has different behavior than `taskkill`
 
-**The Fix:**
+**Solution:** Implement surgical process management in extension code:
 ```typescript
-// ❌ WRONG - Doesn't exist in PI
-pi.registerHook("on_shutdown", { name, handler });
+// 1. SIGKILL the parent instantly (works from Node)
+process.kill(pid, "SIGKILL");
 
-// ✅ CORRECT - Use pi.on() with event names
-pi.on("session_shutdown", async () => {
-  // cleanup code
+// 2. Spawn detached PowerShell to clean up orphans
+spawn("powershell.exe", [
+  "-NoProfile", "-Command",
+  `Get-CimInstance Win32_Process -Filter 'ParentProcessId=${pid}' | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }`
+], { windowsHide: true, stdio: "ignore", detached: true }).unref();
+```
+
+**Lesson:** Never rely on CLI process management on Windows from Node. Use native `process.kill()` + async orphan cleanup.
+
+### 2. Why Claude Code Style (15s + run_in_background)?
+
+**Symptom:** Model was confused by forced 10s backgrounding. It would set `timeout` to wait longer, defeating the purpose.
+
+**Cause:** No explicit escape hatch. The model couldn't express intent to background immediately.
+
+**Solution:** Copy Claude Code exactly:
+- 15s assistant-mode blocking budget (was 10s)
+- `run_in_background: true` parameter for explicit immediate backgrounding
+- Different messages for auto vs explicit backgrounding
+
+**Result:** Model can now express intent: "I know this will take long, background it now" vs "This should be quick, let it run."
+
+### 3. Preview Bug — Capture Before Clear
+
+**Symptom:** Model always saw `(waiting for output...)` even when pre-timeout output existed.
+
+**Cause:** Code cleared `memOutput` before reading the preview.
+
+```typescript
+// WRONG — preview is always empty
+logStream.write(memOutput);
+memOutput = "";  // cleared!
+const preview = memOutput.slice(0, 500);  // always ""
+```
+
+**Solution:** Capture preview BEFORE clearing.
+
+```typescript
+// CORRECT — preview has actual content
+const preview = memOutput.slice(0, 500);
+logStream.write(memOutput);
+memOutput = "";  // now safe to clear
+```
+
+### 4. taskkill /T /F hangs from Node/Bun
+
+`taskkill /T /F /PID` is the documented way to kill process trees on Windows. It **hangs** (ETIMEDOUT) when called via `execSync`, `execFileSync`, or `exec` from Node.js or Bun, targeting a process that is a child of the current process.
+
+Both `taskkill /F /PID` (without /T) and `taskkill /T /F /PID` hang. `process.kill(pid, "SIGKILL")` works instantly (calls `TerminateProcess`).
+
+**Workaround:** SIGKILL the parent, then spawn a detached PowerShell process to find and kill orphans via `Get-CimInstance Win32_Process -Filter 'ParentProcessId=...'`.
+
+### 5. BashResult vs AgentToolResult
+
+The `user_bash` event handler must return `{ result: BashResult }` where:
+
+```typescript
+interface BashResult {
+  output: string;
+  exitCode: number | undefined;
+  cancelled: boolean;
+  truncated: boolean;
+  totalLines: number;
+  totalBytes: number;
+  outputLines: number;
+  outputBytes: number;
+}
+```
+
+Returning `AgentToolResult` shape (`{ content: [{ type: "text", text }], details: {} }`) causes `textContent.unshift is not a function` crash in pi's `recordBashResult()`.
+
+### 6. Built-in bash uses Git Bash, NOT PowerShell
+
+The built-in bash tool resolves to Git Bash at `C:\Program Files\Git\bin\bash.exe`, uses persistent shell sessions via brush-core native bindings, has 300s default timeout, and sets non-interactive env vars (CI=1, PAGER=cat, etc.).
+
+The extension must use the same shell for command compatibility.
+
+### 7. Tool Shadowing via registerTool
+
+`pi.registerTool({ name: "bash" })` shadows the built-in bash tool. The last extension to register a tool with a given name wins. This is how the extension intercepts all LLM bash calls without needing a separate tool.
+
+### 8. user_bash intercepts `!` commands
+
+The `user_bash` event fires when the user types `!` prefix commands. The handler can return `{ result: BashResult }` to fully replace execution. If it returns `undefined`, pi falls through to the built-in handler.
+
+### 9. pi.sendMessage signature
+
+```typescript
+// CORRECT — 2 parameter form
+pi.sendMessage(
+  { customType: "...", content: "...", display: true },
+  { triggerTurn: true, deliverAs: "followUp" }
+);
+
+// WRONG — causes [undefined] in UI
+pi.sendMessage({
+  content: "...",
+  display: true,
+  triggerTurn: true,    // belongs in 2nd param
 });
 ```
 
-**Lesson:**
-Always verify PI's actual API by looking at working extensions (like codemode) rather than assuming standard patterns.
+---
+
+## Technical Insights
+
+### Process Lifecycle on Windows
+
+```
+spawn(bash, ["-l", "-c", "cmake --build"])
+  └── cmake.exe
+        ├── cl.exe (compiler)
+        └── link.exe (linker)
+
+process.kill(bash_pid, "SIGKILL")
+  → bash dies instantly
+  → cmake, cl.exe, link.exe become orphans
+  → PowerShell Get-CimInstance finds them by parent PID
+  → Stop-Process -Force kills them
+```
+
+### Memory Management After Backgrounding
+
+Before timeout: accumulate output in memory (needed for normal return).
+After timeout: stream to log file only via `createWriteStream`. Stop appending to memory strings.
+On completion: read log file for notification content (bounded to last N chars).
+
+This keeps memory O(1) after backgrounding regardless of output size.
+
+### PID Reuse Protection
+
+After a process finishes and the LLM is notified, schedule the entry for removal from `bgProcesses` map after 60s. This prevents stale entries from being confused with new processes that reuse the same PID.
 
 ---
 
-### Mistake 2: Invalid package.json Declarations
+## PI Extension API Notes
 
-**What Happened:**
-Added these to `package.json` which PI doesn't support:
-```json
-{
-  "piPackage": {
-    "keybindings": [...],  // ❌ Not supported
-    "hooks": [...]         // ❌ Not supported
-  }
-}
+### Tool execute() signature
+
+```typescript
+execute(
+  toolCallId: string,
+  params: Static<TParams>,
+  signal: AbortSignal | undefined,    // 3rd param
+  onUpdate: AgentToolUpdateCallback | undefined,  // 4th param
+  ctx: ExtensionContext,              // 5th param
+): Promise<AgentToolResult>
 ```
 
-**What PI Actually Supports:**
-```json
-{
-  "piPackage": {
-    "type": "extension",
-    "tools": ["toolName"],
-    "commands": ["commandName"]
-  }
-}
-```
+### Event handler signatures
 
-**Lesson:**
-PI's manifest is minimal. Don't add speculative features - only use what verified extensions use.
+```typescript
+pi.events.on("user_bash", async (event: UserBashEvent): Promise<UserBashEventResult | undefined> => { ... });
+pi.events.on("session_shutdown", async () => { ... });
+pi.events.on("tool_call", async (event): Promise<ToolCallEventResult | undefined> => { ... });  // can only block
+pi.events.on("tool_result", async (event): Promise<ToolResultEventResult | undefined> => { ... });  // can modify results
+```
 
 ---
 
-### Mistake 3: Multiple PI Config Locations
+## Testing
 
-**What Happened:**
-Initially tried to disable codemode by modifying `settings.json` but PI was loading it from multiple sources:
-1. `~/.pi/agent/settings.json` - packages array
-2. `~/.pi/agent/extensions/` - auto-discovery
-3. `~/Documents/code/pi-codemode-fork/` - direct path reference
+See [TESTING-2026-04-11.md](TESTING-2026-04-11.md) for the standalone test harness.
 
-**The Confusion:**
 ```bash
-# I thought removing from settings.json would disable it
-# But PI still found it at:
-~/Documents/code/pi-codemode-fork/src/index.ts
+bun run test    # 8 tests, no pi needed
+bun run dev     # watch mode
 ```
 
-**The Reality:**
-PI has multiple extension discovery mechanisms:
-1. **Explicit packages** in `settings.json`
-2. **Auto-discovery** from conventional paths
-3. **Git/npm packages** installed globally
-
-**How to Properly Disable:**
-Either:
-- Rename the folder (e.g., `pi-codemode-fork.disabled`)
-- Remove from ALL locations
-- Or modify the extension's internal default state
-
-**Lesson:**
-PI extensions can be loaded from multiple sources. Always check the startup output to see where extensions are actually loading from.
-
----
-
-### Mistake 4: Confusion About .omp vs .pi Directories
-
-**What Happened:**
-The system has TWO separate PI installations/configurations:
-- `~/.omp/agent/` - One PI setup
-- `~/.pi/agent/` - Another PI setup
-
-I was installing extensions to `.omp` but PI was loading from `.pi`!
-
-**Evidence:**
-```bash
-# I installed to:
-~/.omp/agent/extensions/pi-background-bash
-
-# But PI loaded from:
-~/.pi/agent/extensions/pi-background-bash
-```
-
-**Lesson:**
-Always verify which PI instance is actually running. Check `where pi` and the startup banner to know which config directory is active.
-
----
-
-## 💡 Technical Insights
-
-### Insight 1: PI's Event System
-
-PI uses Node.js-style event emitters:
-
-```typescript
-// Subscribe to events
-pi.on("session_start", async (event, ctx) => {
-  // Runs when session starts
-});
-
-pi.on("session_shutdown", async () => {
-  // Cleanup when session ends
-});
-
-pi.on("before_agent_start", async (event) => {
-  // Modify system prompt before agent starts
-  return { systemPrompt: event.systemPrompt + "\n\nAdditional context" };
-});
-```
-
-**Key Events:**
-- `session_start` - Session initialization
-- `session_shutdown` - Cleanup time
-- `before_agent_start` - Modify system prompt
-- `message` - Incoming messages (maybe?)
-
----
-
-### Insight 2: TUI Components Are the ONLY Way to Capture Keyboard
-
-During tool execution, the ONLY way to capture keyboard input (like Ctrl+B) is through the TUI component system:
-
-```typescript
-ctx.ui.custom((tui, theme, keybindings, done) => {
-  return {
-    handleInput(data: string): void {
-      // Ctrl+B detection
-      if (data === '\x02') {  // ASCII for Ctrl+B
-        done('background');
-      }
-    },
-    render(width: number): string[] {
-      return ["UI lines here"];
-    }
-  };
-});
-```
-
-**Critical Understanding:**
-- Tool execution blocks the main thread
-- No global keybinding system exists
-- TUI component has focus and receives keys via `handleInput()`
-- `\x02` is the ASCII control character for Ctrl+B
-
----
-
-### Insight 3: Process Migration Strategy
-
-Windows doesn't support true process migration (like Unix `nohup`). The only reliable pattern is:
-
-```
-1. Kill foreground process
-2. Collect captured output
-3. Spawn new PowerShell job with same command
-4. Transfer output to job
-5. Return job ID
-```
-
-**Trade-offs:**
-- ✅ 100% reliable
-- ✅ Works with any command
-- ❌ Loses 1-2 seconds during transition
-- ❌ Command restarts from beginning
-
-**Alternative Considered:**
-Using Node.js `child_process.spawn({ detached: true })` - but this creates visible console windows and poor lifecycle management.
-
-**Why PowerShell Jobs:**
-- True background execution
-- No visible window
-- Full lifecycle control (Start/Stop/Get/Remove)
-- Survives parent process exit
-
----
-
-### Insight 4: Extension Loading Order Matters
-
-Extensions are loaded in the order they appear in `settings.json`. This matters for:
-
-1. **Tool overrides** - Last extension wins
-2. **Command registration** - First to register gets the name
-3. **Event handlers** - Earlier handlers can modify later ones
-
-**Our Situation:**
-```json
-"packages": [
-  "C:\\...\\pi-codemode-fork",      // Loads first
-  "C:\\...\\pi-background-bash"    // Loads second, can override bash
-]
-```
-
-Both register a `bash` tool - the last one loaded wins (ours).
-
----
-
-## 🎯 PI-Specific Gotchas
-
-### Gotcha 1: Extension Discovery
-
-PI discovers extensions from:
-1. `settings.json` `packages` array (explicit)
-2. `~/.pi/agent/extensions/` (auto-discovery)
-3. Global npm packages with `piPackage` keyword
-4. Git repos cloned to specific directories
-
-**Manifest Format:**
-```json
-{
-  "name": "my-extension",
-  "piPackage": {
-    "type": "extension",
-    "tools": ["toolName"],
-    "commands": ["commandName"]
-  },
-  "main": "dist/index.js"
-}
-```
-
-### Gotcha 2: Tool Override Semantics
-
-Registering a tool with the same name as a default tool REPLACES it:
-
-```typescript
-// This REPLACES the default bash tool
-pi.registerTool({
-  name: "bash",
-  // ... our implementation
-});
-```
-
-**Implication:**
-All bash calls now go through our code. We must maintain full compatibility or things break.
-
-### Gotcha 3: Async Tool Execution
-
-Tool `execute()` functions can be async but must handle:
-- `signal` (AbortSignal) for cancellation
-- `onUpdate()` for streaming output
-- Timeout via the `timeout` parameter
-
-```typescript
-async execute(toolCallId, params, onUpdate, ctx, signal) {
-  // Check for abort
-  signal.addEventListener('abort', () => {
-    cleanup();
-  });
-  
-  // Stream output
-  onUpdate({
-    content: [{ type: "text", text: "partial output" }],
-    details: { partial: true }
-  });
-}
-```
-
-### Gotcha 4: TUI vs Headless Mode
-
-Extensions must handle both modes:
-- **TUI mode:** `ctx.ui` exists, can show components
-- **Headless mode:** `ctx.ui` is undefined, use console/logs
-
-```typescript
-if (ctx.ui?.custom) {
-  // Show TUI component
-} else {
-  // Headless fallback
-}
-```
-
----
-
-## 📚 Reference: Working Extension Pattern
-
-Based on codemode (which works), here's the proven pattern:
-
-### File Structure
-```
-extension/
-├── package.json          # piPackage manifest
-├── src/
-│   └── index.ts         # Main entry point
-├── dist/                # Compiled output
-└── README.md            # Documentation
-```
-
-### package.json Template
-```json
-{
-  "name": "my-extension",
-  "version": "1.0.0",
-  "description": "What it does",
-  "piPackage": {
-    "type": "extension",
-    "tools": ["myTool"],
-    "commands": ["myCommand"]
-  },
-  "main": "dist/index.js",
-  "peerDependencies": {
-    "@mariozechner/pi-coding-agent": "*"
-  }
-}
-```
-
-### Extension Entry Point Template
-```typescript
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
-
-export default function myExtension(pi: ExtensionAPI) {
-  // Register tools
-  pi.registerTool({
-    name: "myTool",
-    label: "My Tool",
-    description: "What it does",
-    parameters: Type.Object({...}),
-    execute: async (toolCallId, params, onUpdate, ctx, signal) => {
-      // Implementation
-    }
-  });
-  
-  // Register commands
-  pi.registerCommand("mycommand", {
-    description: "What it does",
-    handler: async (args, ctx) => {
-      // Implementation
-    }
-  });
-  
-  // Subscribe to events
-  pi.on("session_start", async (event, ctx) => {
-    // Initialization
-  });
-  
-  pi.on("session_shutdown", async () => {
-    // Cleanup
-  });
-}
-```
-
----
-
-## ⚠️ Common Errors and Solutions
-
-### Error: "Failed to load extension: X is not a function"
-
-**Cause:** Using non-existent API methods  
-**Solution:** Check working extensions (codemode, etc.) for valid APIs
-
-### Error: Extension loads but doesn't work
-
-**Cause:** Tool/command name collision or loading order  
-**Solution:** Check PI startup output for extension list, verify names are unique
-
-### Error: Commands not appearing
-
-**Cause:** Package.json `commands` array doesn't match registered command names  
-**Solution:** Ensure `piPackage.commands` includes all registered command names
-
-### Error: Tools not overriding defaults
-
-**Cause:** Extension loaded before default tools, or wrong name  
-**Solution:** Use exact same name as default tool (e.g., "bash"), load later in settings.json
-
----
-
-## 🧪 Testing Strategy
-
-### Manual Testing Checklist
-
-1. **Startup Test**
-   - [ ] PI loads without extension errors
-   - [ ] Extension appears in `[Extensions]` list
-
-2. **Tool Override Test**
-   - [ ] Run a command, verify custom behavior
-   - [ ] Check TUI appears (if applicable)
-
-3. **Command Test**
-   - [ ] Run `/yourcommand`
-   - [ ] Verify it responds correctly
-
-4. **Edge Cases**
-   - [ ] Cancel running command (Ctrl+C)
-   - [ ] Timeout behavior
-   - [ ] Error handling
-
-### Debug Techniques
-
-```typescript
-// Add logging to trace issues
-console.log("Extension loaded");
-console.log("Active tools:", pi.getActiveTools());
-console.log("Event triggered:", event.type);
-```
-
----
-
-## 🔮 Future Considerations
-
-### Cross-Platform Support
-
-Current implementation is Windows-only (PowerShell). For Linux/Mac:
-
-```typescript
-// Platform detection
-const platform = process.platform;
-
-if (platform === 'win32') {
-  // Use PowerShell jobs
-} else {
-  // Use nohup or disown
-}
-```
-
-### Real-Time Output Streaming
-
-Current implementation polls every 2 seconds. Better approach:
-- Use WebSocket or EventSource
-- Push notifications on job completion
-- Watch file for changes (fs.watch)
-
-### Configuration System
-
-PI extensions should support user configuration:
-
-```typescript
-// Read from PI settings
-const settings = pi.getSettings();
-const timeout = settings["pi-background-bash"]?.timeout || 300;
-```
-
----
-
-## 📖 Resources for Future Agents
-
-### Essential References
-
-1. **Working Examples:**
-   - `~/Documents/code/pi-codemode-fork/src/index.ts`
-   - `~/.pi/agent/extensions/` (all installed extensions)
-
-2. **PI Documentation:**
-   - https://pi.dev/docs/extensions (if available)
-   - Ask PI: "How do I create an extension?"
-
-3. **Community Extensions:**
-   - npm packages with `pi-package` keyword
-   - GitHub repos tagged with `pi-extension`
-
-### When Stuck
-
-1. Look at codemode - it's complex but works
-2. Check PI's startup output for extension loading messages
-3. Verify API calls against working extensions
-4. Use `console.log()` liberally for debugging
-5. Remember: PI's API is minimal and specific
-
----
-
-## 📝 Changelog of Learnings
-
-### 2026-04-03 - Initial Documentation
-- Documented mistakes with registerHook
-- Documented package.json limitations
-- Documented multiple config locations (.omp vs .pi)
-- Documented TUI keyboard capture
-- Documented process migration strategy
-
----
-
-**For Future Agents:**
-
-When working on this project:
-1. Read this file FIRST
-2. Check the actual PI API in codemode or other working extensions
-3. Don't assume standard extension patterns
-4. Test incrementally - verify each piece works
-5. Update this file with new learnings
-
-**Remember:** PI is minimal and opinionated. Less is more. Don't over-engineer.
+### Version History
+
+| Version | Date | Key Changes |
+|---------|------|-------------|
+| v1.0 | 2026-04-03 | Initial release with PowerShell backgrounding |
+| v2.0 | 2026-04-11 | Rewritten for Git Bash, forced 10s backgrounding |
+| v3.0 | 2026-04-13 | Claude Code style: 15s budget + `run_in_background` parameter |

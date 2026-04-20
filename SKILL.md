@@ -1,255 +1,147 @@
-# SKILL: Background Bash Tool Usage
+# SKILL: Background Process Management
 
-## Core Concept
+## What This Extension Does
 
-This extension makes PI work like **Claude Code**:
-- Commands run **blocking by default** (normal behavior)
-- Press **Ctrl+B** during execution to **send to background**
-- Use `/tasks` to manage background jobs
+Automatically backgrounds long-running bash commands on Windows:
 
-## When to Use Ctrl+B
+- Commands that finish in <15s return normally (no change in behavior)
+- Commands still running after 15s are auto-detached and continue running
+- LLM gets auto-notified when the background process completes
+- User can check/manage via `/win_tasks`
 
-### ALWAYS press Ctrl+B if:
+## When Backgrounding Happens
 
-1. **Command is taking too long**
-   - npm install is still running after 2 minutes
-   - Build process is ongoing
-   - Tests are running
+Any bash command that exceeds 15 seconds is automatically backgrounded. This includes:
+- cmake builds
+- npm install on large projects
+- Long-running test suites
+- Any command the LLM runs via the bash tool
 
-2. **You want to do something else while waiting**
-   - "While that runs, can you check..."
-   - "Let me look at the code while this builds"
-
-3. **Auto-background kicks in** (after 5 minutes)
-   - Extension automatically sends long commands to background
-   - You'll see: "Auto-backgrounding..."
-
-### Keep it BLOCKING if:
-
-1. **Quick commands** (< 30 seconds)
-   - `ls`, `git status`, `cat file.txt`
-   - No need to background, just wait
-
-2. **You need the result immediately for next step**
-   - Getting a value to use in next command
-   - Sequential dependent operations
-
-3. **User explicitly says "wait for it"**
-   - "Run npm test and wait for results"
-
-## Workflow Examples
-
-### Example 1: Background npm install
+## Decision Flow
 
 ```
-You: Run npm install
-Agent: ⚡ Running: npm install
-       ⏱  Elapsed: 1m 15s
-       
-       [You: Press Ctrl+B]
-       
-       🔄 Sent to background (Ctrl+B)
-       Job ID: job-1743691234567-abc123xyz
-
-You: While that runs, what files are in src/
-Agent: <lists files while npm install runs>
-
-You: Check if npm install finished
-Agent: <runs /tasks>
-       🟢 job-1743691234567-abc123xyz | completed | 3m 12s | npm install
-       
-       npm install completed successfully! 847 packages installed.
+Command needs to run?
+    ↓
+Will it take > 15 seconds AND you don't need the result immediately?
+    ├─ YES → Use run_in_background: true (background immediately)
+    │
+    ├─ MAYBE, but you need it to finish this turn → Use no_background: true
+    │        (waits for completion; disables auto-backgrounding)
+    │
+    └─ NO → Just call bash normally
 ```
 
-### Example 2: Auto-background after 5 minutes
+## Tools Available
 
-```
-You: Run npm run build
-Agent: ⚡ Running: npm run build
-       ⏱  Elapsed: 5m 0s
-       
-       Auto-backgrounding...
-       
-       🔄 Sent to background (timeout)
-       Job ID: job-1743691234567-abc123xyz
+### `bash` (shadows built-in)
 
-You: What's taking so long?
-Agent: <checks /tasks output job-1743691234567-abc123xyz>
-       Build is still running, compiling TypeScript...
+```json
+// Normal usage — auto-backgrounds after 15s if still running
+{ "command": "cmake --build build" }
+
+// Background immediately (for builds, installs, dev servers)
+{ "command": "npm install", "run_in_background": true }
+
+// Wait for completion — disable auto-backgrounding
+{ "command": "find . -name '*.ts'", "no_background": true }
 ```
 
-### Example 3: Dev server (must background)
+### `win_bg_status` (for LLM)
 
 ```
-You: Start the dev server
-Agent: ⚡ Running: npm run dev
-       ⏱  Elapsed: 0m 5s
-       
-       [You: Press Ctrl+B immediately]
-       
-       🔄 Sent to background (Ctrl+B)
-       Job ID: job-1743691234567-abc123xyz
-       
-       Server running at http://localhost:3000
-
-You: Open the main page in browser
-Agent: <helps while server runs in background>
+win_bg_status({ action: "list" })           → show all backgrounded processes
+win_bg_status({ action: "delta" })          → only changed since last check
+win_bg_status({ action: "log", pid: 123 })  → view process output
+win_bg_status({ action: "stop", pid: 123 }) → kill process tree
+win_bg_status({ action: "progress", pid: 123 }) → check if running/stalled
 ```
 
-## User Prompts That Mean "Use Ctrl+B"
+### `win_path` (for LLM)
 
-When user says these, **suggest Ctrl+B**:
+Converts any Windows path into all three common formats at once. Use this instead of guessing `cygpath` round-trips.
 
-- "This is taking too long"
-- "Can we do something else while this runs?"
-- "Let me check something while that runs"
-- "Is there a way to run this in background?"
-- "This is freezing the terminal"
-
-## Managing Background Tasks
-
-### After backgrounding a command, you should:
-
-1. **Tell user the job ID**
-2. **Suggest /tasks command**
-3. **Offer to check status periodically**
-
-Example response:
-
-```
-You: <npm install is taking a while>
-
-Agent: 🔄 Sent to background (Ctrl+B)
-       
-       Job ID: job-1743691234567-abc123xyz
-       Command: npm install
-       Status: running in background
-       
-       You can:
-       - Check all tasks with /tasks
-       - View output with /tasks output job-1743691234567-abc123xyz
-       - Kill it with /tasks kill job-1743691234567-abc123xyz
-       
-       What would you like to work on while that runs?
+```json
+{ "path": "C:\\Users\\name\\Documents" }
 ```
 
-### Checking on tasks:
+Returns:
+```
+Git Bash:  /c/Users/name/Documents
+Win32:     C:\Users\name\Documents
+file://:   file:///C:/Users/name/Documents
+```
+
+### `/win_tasks` (for user)
 
 ```
-You: Is npm install done yet?
-
-Agent: <runs /tasks>
-       🟢 job-1743691234567-abc123xyz | completed | 5m 43s | npm install
-       
-       npm install completed successfully!
-       Added 847 packages in 5m 43s
+/win_tasks               → list all background tasks
+/win_tasks output 123    → view output for PID 123
+/win_tasks kill 123      → kill process tree for PID 123
 ```
+
+## After Backgrounding
+
+When a command gets backgrounded, you'll see:
+
+```
+Command exceeded the assistant-mode blocking budget (15s) and was moved to the background with PID: 49281.
+```
+
+When it completes, you'll automatically receive:
+
+```
+[BG_DONE] PID 49281 finished (exit 0) in 47s
+Command: cmake --build build
+...output...
+```
+
+## What You Can Do While Waiting
+
+While a background process runs, you can:
+- Ask the LLM to do other work (read files, search code, etc.)
+- Check progress: `win_bg_status({ action: "log", pid: 49281 })`
+- Stop it: `win_bg_status({ action: "stop", pid: 49281 })`
+- Or user: `/win_tasks output 49281`
 
 ## Common Patterns
 
-### Pattern 1: Install deps, then explore
-
-```
-You: Run npm install
-Agent: ⚡ Running: npm install...
-       [Ctrl+B after 30s]
-       🔄 Sent to background
-
-User: What files are in the project?
-
-Agent: <lists files while npm install runs>
-      
-You: Check if npm install finished
-Agent: 🟢 Completed! 847 packages installed.
+### Pattern 1: Long build or install
+```json
+{ "command": "npm install", "run_in_background": true }
 ```
 
-### Pattern 2: Build and review code
-
-```
-You: Run npm run build
-Agent: ⚡ Running: npm run build
-       [Auto-backgrounds after 5min]
-       🔄 Sent to background (timeout)
-
-User: While that builds, can you review src/utils/helpers.ts?
-
-Agent: <reviews code while build runs>
-
-You: Is the build done?
-Agent: 🟢 Completed! Build took 7m 12s, 0 errors.
+### Pattern 2: Search you need synchronously
+```json
+{ "command": "find . -name '*.test.ts'", "no_background": true }
 ```
 
-### Pattern 3: Long-running tests
+### Pattern 3: Write + lint + test a script in one call
+Instead of three separate bash calls, write the file first, then run validation in a single compound command:
 
-```
-You: Run the full test suite
-Agent: ⚡ Running: npm test
-       ⏱  Elapsed: 2m 30s (running 847 tests)
-
-User: This is taking a while, I'll check email
-
-Agent: Want me to send this to background so you can keep working?
-       Press Ctrl+B or I can background it for you.
-
-[User presses Ctrl+B]
-
-Agent: 🔄 Sent to background!
-       Job ID: job-1743691234567-abc123xyz
-       
-       I'll check on the tests. What else can I help with?
+```json
+{
+  "command": "cat > test-script.js << 'EOF'\nconst add = (a, b) => a + b;\nconsole.log(add(2, 3));\nEOF && node -c test-script.js && node test-script.js",
+  "no_background": true
+}
 ```
 
-## Important Notes
-
-### Windows-Specific
-
-- Background jobs run as **PowerShell jobs**
-- Output saved to `%TEMP%\pi-background-bash\`
-- No console windows pop up
-- Works with Windows Terminal, cmd, PowerShell
-
-### What Can't Be Backgrounded Well
-
-1. **Interactive commands**
-   - `git commit` (opens editor)
-   - `npm init` (prompts for input)
-   - Commands with `read` or prompts
-
-2. **Commands depending on your shell environment**
-   - Aliases won't work
-   - Custom functions not available
-   - Profile not loaded
-
-3. **Very short commands**
-   - `ls`, `pwd`, `echo` - no point in backgrounding
-
-### Best Practices
-
-1. **Don't preemptively background** - Wait to see if it's slow
-2. **Suggest Ctrl+B when commands take > 1 minute**
-3. **Offer to check status periodically**
-4. **Always tell user the job ID when backgrounding**
-
-## Commands Reference
-
-```bash
-# During command execution:
-Ctrl+B          # Send to background
-Ctrl+C          # Cancel/kill
-
-# After backgrounding:
-/tasks                      # List all tasks
-/tasks output <id>          # View task output
-/tasks kill <id>            # Stop a task
+Or for PowerShell-friendly one-liners:
+```json
+{
+  "command": "echo 'console.log(1+1)' > test.js && node -c test.js && node test.js",
+  "no_background": true
+}
 ```
 
-## Remember
+### Pattern 4: Path conversion before using a file:// URL
+```json
+{ "path": "C:\\Users\\name\\Documents\\project\\file.txt" }
+```
+Use the `file://` output for Node `new URL()` or browser preload URLs.
 
-> **Ctrl+B is your escape hatch.** When a command is taking too long and blocking work, press Ctrl+B to free up the terminal while keeping the command running.
+## Edge Cases
 
-Default behavior is blocking (like normal bash). Only background when:
-- Command is slow (> 1-2 minutes)
-- User wants to do something else
-- Auto-background kicks in (5 minutes)
-
-The user is always in control - they can press Ctrl+B anytime, or you can suggest it when appropriate.
+- **Interactive commands** (needing stdin) will hang and get backgrounded, then never finish
+- **Very short commands** (<15s) are never affected
+- **Process tree killing** uses SIGKILL + PowerShell orphan cleanup for cmake/cl.exe trees
+- **Using `no_background: true`** on very long commands (>2–3 minutes) will block the agent — only use it when you genuinely need the result before continuing
